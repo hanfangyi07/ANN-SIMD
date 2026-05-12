@@ -7,8 +7,10 @@
 #include <vector>
 #include <functional>
 #include <algorithm>
+#include <fstream>
+#include <iostream>
 
-// ==================== 基础 NEON 内积（朴素 SIMD） ====================
+// 基础 NEON 内积（朴素 SIMD）
 // 每次处理 4 个 float（128 位），使用单个累加器
 inline float inner_product_neon(const float* a, const float* b, size_t d) {
     float32x4_t sum_vec = vdupq_n_f32(0.0f);
@@ -23,7 +25,7 @@ inline float inner_product_neon(const float* a, const float* b, size_t d) {
     return 1.0f - sum;
 }
 
-// ==================== 循环展开 2 倍 ====================
+// 循环展开 2 倍 
 // 一次处理 8 个 float，使用两个累加器以减少依赖
 inline float inner_product_neon_unroll2(const float* a, const float* b, size_t d) {
     float32x4_t sum1 = vdupq_n_f32(0.0f);
@@ -43,7 +45,7 @@ inline float inner_product_neon_unroll2(const float* a, const float* b, size_t d
     return 1.0f - total;
 }
 
-// ==================== 循环展开 4 倍 ====================
+// 循环展开 4 倍 
 // 一次处理 16 个 float，使用四个累加器，最大化指令级并行
 inline float inner_product_neon_unroll4(const float* a, const float* b, size_t d) {
     float32x4_t sum1 = vdupq_n_f32(0.0f);
@@ -73,7 +75,7 @@ inline float inner_product_neon_unroll4(const float* a, const float* b, size_t d
     return 1.0f - total;
 }
 
-// ==================== 优化 A：双累加器 + 批量加载 8 float ====================
+// 优化 A：双累加器 + 批量加载 8 float 
 // 使用 vld1q_f32_x2 一次加载 8 个 float，减少加载指令条数
 inline float inner_product_neon_optA(const float* a, const float* b, size_t d) {
     float32x4_t sum1 = vdupq_n_f32(0.0f);
@@ -91,7 +93,7 @@ inline float inner_product_neon_optA(const float* a, const float* b, size_t d) {
     return 1.0f - total;
 }
 
-// ==================== 优化 B：四累加器 + 批量加载 16 float ====================
+// 优化 B：四累加器 + 批量加载 16 float 
 // 使用 vld1q_f32_x4 一次加载 16 个 float，四个累加器并行，达到最佳性能
 inline float inner_product_neon_optB(const float* a, const float* b, size_t d) {
     float32x4_t sum1 = vdupq_n_f32(0.0f);
@@ -115,7 +117,7 @@ inline float inner_product_neon_optB(const float* a, const float* b, size_t d) {
     return 1.0f - total;
 }
 
-// ==================== 优化 C：双累加器 + 批量加载 8 float + 软件预取 ====================
+// 优化 C：双累加器 + 批量加载 8 float + 软件预取
 // 在优化 A 基础上加入预取指令，尝试隐藏访存延迟
 inline float inner_product_neon_optC(const float* a, const float* b, size_t d) {
     float32x4_t sum1 = vdupq_n_f32(0.0f);
@@ -135,7 +137,7 @@ inline float inner_product_neon_optC(const float* a, const float* b, size_t d) {
     return 1.0f - total;
 }
 
-// ==================== Flat-SIMD 搜索函数包装 ====================
+//Flat-SIMD 搜索函数包装 
 // 以下函数均调用上述内积实现，返回 top‑k 索引（最小距离优先的优先队列）
 
 std::priority_queue<std::pair<float, uint32_t>> flat_search_simd(
@@ -204,8 +206,7 @@ std::priority_queue<std::pair<float, uint32_t>> flat_search_simd_optC(
     return q;
 }
 
-// ==================== SQ（标量量化）相关函数 ====================
-
+//SQ（标量量化）相关函数
 // 计算两个 int8 向量的点积，一次处理 16 个元素
 inline int32_t dot_int8_neon(const int8_t* a, const int8_t* b, size_t d) {
     int32x4_t sum = vdupq_n_s32(0);
@@ -264,8 +265,46 @@ std::priority_queue<std::pair<float, uint32_t>> sq_search(
     return q;
 }
 
-// ==================== PQ（乘积量化）相关函数 ====================
+// PQ（乘积量化）相关函数
+// 加载码本：m 个子空间，每个子空间 256 个中心，每个中心 sub_dim 维 float
+std::vector<std::vector<float>> load_codebook(const std::string& path, int m, int sub_dim) {
+    std::ifstream fin(path, std::ios::binary);
+    if (!fin) {
+        std::cerr << "Failed to open codebook file: " << path << std::endl;
+        exit(1);
+    }
+    std::vector<std::vector<float>> codebook(m);
+    for (int s = 0; s < m; ++s) {
+        codebook[s].resize(256 * sub_dim);
+        fin.read((char*)codebook[s].data(), 256 * sub_dim * sizeof(float));
+        if (!fin) {
+            std::cerr << "Error reading codebook for subspace " << s << std::endl;
+            exit(1);
+        }
+    }
+    fin.close();
+    return codebook;
+}
 
+// 加载编码：m 个子空间，每个子空间 base_num 个 uint8
+std::vector<std::vector<uint8_t>> load_codes(const std::string& path, int m, size_t base_num) {
+    std::ifstream fin(path, std::ios::binary);
+    if (!fin) {
+        std::cerr << "Failed to open codes file: " << path << std::endl;
+        exit(1);
+    }
+    std::vector<std::vector<uint8_t>> codes(m);
+    for (int s = 0; s < m; ++s) {
+        codes[s].resize(base_num);
+        fin.read((char*)codes[s].data(), base_num);
+        if (!fin) {
+            std::cerr << "Error reading codes for subspace " << s << std::endl;
+            exit(1);
+        }
+    }
+    fin.close();
+    return codes;
+}
 // 为单个子空间构建查找表（LUT），256 个中心，利用 SIMD 内积
 inline void build_lut_subspace(const float* sub_q, const float* codebook_sub, float* lut_sub, int sub_dim) {
     for (int c = 0; c < 256; ++c) {
@@ -392,5 +431,128 @@ inline std::priority_queue<std::pair<float, uint32_t>> pq_search_optimized(
     }
     return q;
 }
+// IVF + PQ 高级索引（附录里面提到的AI辅助进阶优化）
 
+struct IVFIndex {
+    std::vector<std::vector<uint32_t>> lists;
+    int n_centroids;
+};
+
+// 加载 IVF 中心点
+inline std::vector<float> load_ivf_centroids(const std::string& path, int& n_centroids, int vecdim) {
+    std::ifstream fin(path, std::ios::binary);
+    if (!fin) {
+        std::cerr << "Failed to open " << path << std::endl;
+        exit(1);
+    }
+    fin.seekg(0, std::ios::end);
+    size_t file_size = fin.tellg();
+    fin.seekg(0, std::ios::beg);
+    n_centroids = file_size / (vecdim * sizeof(float));
+    std::vector<float> centroids(n_centroids * vecdim);
+    fin.read((char*)centroids.data(), file_size);
+    fin.close();
+    return centroids;
+}
+
+// 加载倒排列表
+inline IVFIndex load_ivf_inverted(const std::string& path) {
+    std::ifstream fin(path, std::ios::binary);
+    if (!fin) {
+        std::cerr << "Failed to open " << path << std::endl;
+        exit(1);
+    }
+    IVFIndex idx;
+    while (true) {
+        uint32_t len;
+        fin.read((char*)&len, 4);
+        if (!fin) break;
+        std::vector<uint32_t> lst(len);
+        if (len > 0) {
+            fin.read((char*)lst.data(), len * sizeof(uint32_t));
+        }
+        idx.lists.push_back(std::move(lst));
+    }
+    idx.n_centroids = idx.lists.size();
+    fin.close();
+    return idx;
+}
+
+// IVF + PQ 优化版搜索
+inline std::priority_queue<std::pair<float, uint32_t>> ivf_pq_search_optimized(
+    float* base, float* query,
+    const std::vector<std::vector<float>>& pq_codebook,
+    const std::vector<std::vector<uint8_t>>& pq_codes,
+    const std::vector<float>& ivf_centroids,
+    const IVFIndex& ivf_index,
+    size_t base_num, size_t vecdim, size_t k, size_t p, int nprobe)
+{
+    int m = pq_codebook.size();
+    int sub_dim = vecdim / m;
+
+    // 1. 选择最近的 nprobe 个中心
+    std::vector<std::pair<float, int>> cent_dist(ivf_index.n_centroids);
+    for (int c = 0; c < ivf_index.n_centroids; ++c) {
+        float dist = inner_product_neon_optB(query, &ivf_centroids[c * vecdim], vecdim);
+        cent_dist[c] = {dist, c};
+    }
+    std::partial_sort(cent_dist.begin(), cent_dist.begin() + nprobe, cent_dist.end());
+    std::vector<int> selected;
+    for (int i = 0; i < nprobe; ++i) selected.push_back(cent_dist[i].second);
+
+    // 2. 收集所有选中中心对应的 base 索引
+    std::vector<uint32_t> cand_indices;
+    for (int c : selected) {
+        cand_indices.insert(cand_indices.end(), ivf_index.lists[c].begin(), ivf_index.lists[c].end());
+    }
+    if (cand_indices.empty()) return {};
+
+    // 3. 构建 LUT
+    std::vector<std::vector<float>> lut(m, std::vector<float>(256));
+    for (int s = 0; s < m; ++s) {
+        const float* sub_q = query + s * sub_dim;
+        const float* cb = pq_codebook[s].data();
+        float* lut_s = lut[s].data();
+        for (int c = 0; c < 256; ++c) {
+            lut_s[c] = inner_product_neon_optB(cb + c * sub_dim, sub_q, sub_dim);
+        }
+    }
+
+    // 4. 对候选索引执行查表累加
+    const size_t BLOCK = 8;
+    std::vector<std::pair<float, uint32_t>> approx;
+    size_t num_cand = cand_indices.size();
+    for (size_t idx = 0; idx < num_cand; idx += BLOCK) {
+        size_t valid = std::min(BLOCK, num_cand - idx);
+        float dist[BLOCK] = {0};
+        for (int s = 0; s < m; ++s) {
+            const uint8_t* code_ptr = pq_codes[s].data();
+            const float* lut_s = lut[s].data();
+            for (size_t j = 0; j < valid; ++j) {
+                uint32_t base_idx = cand_indices[idx + j];
+                uint8_t id = code_ptr[base_idx];
+                dist[j] += lut_s[id];
+            }
+        }
+        for (size_t j = 0; j < valid; ++j) {
+            approx.emplace_back(dist[j], cand_indices[idx + j]);
+        }
+    }
+
+    // 5. 取前 p 个候选并精排
+    if (approx.size() > p) {
+        std::partial_sort(approx.begin(), approx.begin() + p, approx.end());
+        approx.resize(p);
+    } else {
+        std::sort(approx.begin(), approx.end());
+    }
+
+    std::priority_queue<std::pair<float, uint32_t>> q;
+    for (auto& item : approx) {
+        float dis = inner_product_neon_optB(base + item.second * vecdim, query, vecdim);
+        if (q.size() < k) q.push({dis, item.second});
+        else if (dis < q.top().first) { q.push({dis, item.second}); q.pop(); }
+    }
+    return q;
+}
 #endif // MY_SIMD_H
